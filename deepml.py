@@ -24,7 +24,7 @@ import os, re, zipfile
 from itertools import combinations
 
 # ================= settings =================
-USE_LEAGUES = ['EPL']                       # e.g. ['EPL', 'LaLiga', 'SerieA']
+USE_LEAGUES = ['EPL', 'LaLiga', 'SerieA']                       # e.g. ['EPL', 'LaLiga', 'SerieA']
 DATA_DIR = '/content'                       # folder containing the zip files
 ZIPS = {'EPL':    '00_01-26_27-Prem.zip',
         'LaLiga': '05_06-26_27-laliga.zip',
@@ -182,30 +182,15 @@ display(cov[(cov < 1).any(axis=1)].round(2))
 Here, the combined dataset is split into `train`, `val`, and `test` sets based on the season. The very first season (2000/01) is excluded from training as it is used as a 'burn-in' period for the Elo ratings. The resulting splits are saved to separate CSV files.
 """
 
-# Split by season (2000/01 excluded from training as Elo burn-in)
-all_seasons = sorted(combined_raw_df['Season'].unique())
-print(f"All seasons found: {all_seasons}\n")
-
-train_seasons = all_seasons[1:all_seasons.index('2022/23')]   # 2001/02–2021/22
-val_seasons   = ['2022/23', '2023/24']
-test_seasons  = [s for s in all_seasons if s >= '2024/25']
-
-print(f"Train seasons: {train_seasons}")
-print(f"Val seasons:   {val_seasons}")
-print(f"Test seasons:  {test_seasons}\n")
-
-def subset(seasons):
-    return combined_raw_df[combined_raw_df['Season'].isin(seasons)].drop(columns=['Date_Parsed']).copy()
-
-train_df_final = subset(train_seasons)
-val_df_final   = subset(val_seasons)
-test_df_final  = subset(test_seasons)
-
-train_df_final.to_csv('/content/train_data.csv', index=False)
-val_df_final.to_csv('/content/val_data.csv', index=False)
-test_df_final.to_csv('/content/test_data.csv', index=False)
-
-print(f"Train: {train_df_final.shape}, Val: {val_df_final.shape}, Test: {test_df_final.shape}")
+# Splits come from the 'Split' column made in the loading cell.
+# 'burnin' matches (each league's first season) are history only, never training targets.
+SPLIT_NAMES = ['train', 'stop', 'val', 'test']
+split_dfs = {s: combined_raw_df[combined_raw_df['Split'] == s].drop(columns=['Date_Parsed'])
+             for s in SPLIT_NAMES}
+for s, sdf in split_dfs.items():
+    sdf.to_csv(f'/content/{s}_data.csv', index=False)
+    print(f"{s:5s}: {len(sdf):6d} matches, seasons {sdf.Season.min()} to {sdf.Season.max()}")
+train_df_final, val_df_final, test_df_final = split_dfs['train'], split_dfs['val'], split_dfs['test']
 
 ### Sanity Checks and Verifications
 ## Below is the code verifying that the original dataset files were cleaned properly and containing no duplicates.
@@ -332,16 +317,16 @@ def team_view(side):
     return v
 
 long = pd.concat([team_view('H'), team_view('A')]).sort_values('match', kind='stable')
-long[STAT_COLS] = long[STAT_COLS].fillna(0).astype(float)
+long[STAT_COLS] = long[STAT_COLS].astype(float)
+long['League'] = long['match'].map(df['League'])
 
-# Splits come from cell 2 (2000/01 = Elo burn-in, not used)
-SPLITS = {'train': train_seasons, 'val': val_seasons, 'test': test_seasons}
-
-# Normalise stats with TRAIN statistics only
-train_rows = long['match'].map(df['Season']).isin(SPLITS['train'])
-mu = long.loc[train_rows, STAT_COLS].mean()
-sd = long.loc[train_rows, STAT_COLS].std()
-long[STAT_COLS] = (long[STAT_COLS] - mu) / sd
+# Normalise each stat WITHIN its league, using that league's TRAIN matches only
+train_rows = long['match'].map(df['Split']).eq('train')
+mu = long[train_rows].groupby('League')[STAT_COLS].mean()
+sd = long[train_rows].groupby('League')[STAT_COLS].std()
+long[STAT_COLS] = ((long[STAT_COLS] - mu.loc[long['League']].to_numpy())
+                   / sd.loc[long['League']].to_numpy())
+long[STAT_COLS] = long[STAT_COLS].fillna(0.0)          # missing stat → league average
 
 # Position of each match in each team's own history
 long['pos'] = long.groupby('team').cumcount()
@@ -369,14 +354,15 @@ def make_dataset(W):
     Xh = build_windows(df['HomeTeam'], home_pos, W)
     Xa = build_windows(df['AwayTeam'], away_pos, W)
     data = {'n_feat': Xh.shape[2]}
-    for name, ss in SPLITS.items():
-        m = df['Season'].isin(ss).to_numpy()
+    for name in SPLIT_NAMES:
+        m = (df['Split'] == name).to_numpy()
         data[name] = {k: torch.tensor(v[m]).to(device) for k, v in
                       {'xh': Xh, 'xa': Xa, 'eh': elo_h, 'ea': elo_a, 'y': y_all}.items()}
+        data[name]['league'] = df['League'].to_numpy()[m]     # for per-league results
     return data
 
 data32 = make_dataset(32)
-for s in SPLITS:
+for s in SPLIT_NAMES:
     print(s, tuple(data32[s]['xh'].shape))
 
 """### 6. Neural Network Model Definition (`FormElo`)
@@ -451,7 +437,7 @@ def evaluate(model, d):
 def train(data, use_gru=True, use_elo=True, hidden=32, lr=3e-3, wd=1e-4,
           epochs=40, patience=5, bs=1024, seed=0):
     torch.manual_seed(seed)
-    tr, va = data['train'], data['val']
+    tr, va = data['train'], data['stop']             # early stopping on 2021/22, not val
     model = FormElo(data['n_feat'], hidden, use_gru, use_elo).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
     best, best_state, bad = float('inf'), None, 0
@@ -530,6 +516,15 @@ for name in ['GRU only', 'GRU + Elo']:
                         predict(trained['Elo only'], data32['val']), yv)
     print(f'[val] {name:10s} vs Elo only: ΔRPS = {m:+.4f}   95% CI [{lo:+.4f}, {hi:+.4f}]')
 
+# Per-league validation RPS (seed ensembles)
+lg = data32['val']['league']
+per_league = {}
+for name, ms in trained.items():
+    r = rps_each(predict(ms, data32['val']), yv).cpu().numpy()
+    per_league[name] = {l: r[lg == l].mean() for l in np.unique(lg)}
+print('Validation RPS per league:')
+display(pd.DataFrame(per_league).T.round(4))
+
 """### 8. Final Test Set Evaluation
 Once all hyperparameters and architectures are finalized on the validation set, this cell evaluates the ensembles on the **Test** set to estimate actual out-of-sample performance.
 """
@@ -553,19 +548,18 @@ Finally, this cell calculates the RPS of the historical Bet365 odds (after remov
 # Bookmaker benchmark (odds are NOT model inputs, only a reference)
 odds = df[['B365H', 'B365D', 'B365A']].to_numpy(float)
 p_book = (1 / odds) / (1 / odds).sum(1, keepdims=True)        # remove the margin
-y_np = df['FTR'].map({'H': 0, 'D': 1, 'A': 2}).to_numpy()
+has_odds = ~np.isnan(p_book).any(1)
 
 rows = {}
-for s in val_seasons + test_seasons:
-    m = (df['Season'] == s).to_numpy() & ~np.isnan(p_book).any(1)
-    rows[s] = {'matches': int(m.sum()),
-               'home_win_rate': (y_np[m] == 0).mean(),
-               'RPS bookmaker': metrics(torch.tensor(p_book[m]), torch.tensor(y_np[m]))['RPS']}
 for split in ['val', 'test']:
-    m = df['Season'].isin(SPLITS[split]).to_numpy() & ~np.isnan(p_book).any(1)
-    rows[f'ALL {split}'] = {'matches': int(m.sum()),
-                            'home_win_rate': (y_np[m] == 0).mean(),
-                            'RPS bookmaker': metrics(torch.tensor(p_book[m]), torch.tensor(y_np[m]))['RPS']}
+    for league in [*sorted(df['League'].unique()), 'All']:
+        m = (df['Split'] == split).to_numpy() & has_odds
+        if league != 'All':
+            m &= (df['League'] == league).to_numpy()
+        rows[(split, league)] = {'matches': int(m.sum()),
+                                 'home_win_rate': (y_all[m] == 0).mean(),
+                                 'RPS bookmaker': metrics(torch.tensor(p_book[m]),
+                                                          torch.tensor(y_all[m]))['RPS']}
 display(pd.DataFrame(rows).T.round(4))
 
 print(FormElo(data32['n_feat'], use_gru=True, use_elo=False).gru.input_size,   # 18 → Elo-free
