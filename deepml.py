@@ -20,9 +20,17 @@ This cell handles the initial data pipeline. It reads all historical season file
 
 import pandas as pd
 import numpy as np
-import os
+import os, re, zipfile
+from itertools import combinations
 
-# 1. Columns to keep (B365 odds are used ONLY as a benchmark, never as model inputs)
+# ================= settings =================
+USE_LEAGUES = ['EPL']                       # e.g. ['EPL', 'LaLiga', 'SerieA']
+DATA_DIR = '/content'                       # folder containing the zip files
+ZIPS = {'EPL':    '00_01-26_27-Prem.zip',
+        'LaLiga': '05_06-26_27-laliga.zip',
+        'SerieA': '11_12-26_27-seriea.zip'}
+
+# Columns to keep (B365 odds are used ONLY as a benchmark, never as model inputs)
 target_columns = [
     'Div', 'Date', 'HomeTeam', 'AwayTeam',
     'FTHG', 'FTAG', 'FTR', 'HTHG', 'HTAG', 'HTR',
@@ -31,13 +39,33 @@ target_columns = [
     'B365H', 'B365D', 'B365A'
 ]
 
+# ================= 1. Unzip and find season files =================
+def extract_league(league):
+    """Unzip one league to /content/leagues/<league>/ and return {season: csv_path}.
+       Season comes from the FILE NAME (26_27.csv -> 2026/27), not match dates,
+       because 2019/20 ended in July/August 2020."""
+    out = f'/content/leagues/{league}'
+    with zipfile.ZipFile(os.path.join(DATA_DIR, ZIPS[league])) as z:
+        z.extractall(out)
+    files = {}
+    for root, _, fnames in os.walk(out):
+        if '__MACOSX' in root:
+            continue
+        for f in fnames:
+            m = re.fullmatch(r'(\d\d)_(\d\d)\.csv', f)
+            if m:
+                season = f'20{m[1]}/{m[2]}'
+                assert season not in files, f'{league}: two files for {season}'
+                files[season] = os.path.join(root, f)
+    return dict(sorted(files.items()))
+
+FILES = {league: extract_league(league) for league in USE_LEAGUES}
+
 def season_files():
-    """Yield (filename, path) for 00_01.csv .. 26_27.csv that exist."""
-    for y in range(27):
-        filename = f"{y:02d}_{y + 1:02d}.csv"
-        path = f"/content/{filename}"
-        if os.path.exists(path):
-            yield filename, path
+    """Yield (label, path) for every season file in use (used by the verification cell)."""
+    for league, files in FILES.items():
+        for path in files.values():
+            yield f'{league} {os.path.basename(path)}', path
 
 def load_season(path):
     """Read one season file; rows with extra trailing fields are truncated, not dropped."""
@@ -53,45 +81,41 @@ def parse_dates(s):
     d[mask] = pd.to_datetime(s[mask], format='%d/%m/%Y', errors='coerce')
     return d
 
-# 2. Load and combine (season taken from the file name: 19_20.csv → 2019/20)
-all_dfs = []
-for filename, path in season_files():
-    df = load_season(path)
-    df = df[[c for c in target_columns if c in df.columns]].copy()
-    y = int(filename[:2])
-    df['Season'] = f"{2000 + y}/{y + 1:02d}"
-    all_dfs.append(df)
+# ================= 2. Load each league =================
+def load_league(league):
+    parts = []
+    for season, path in FILES[league].items():
+        d = load_season(path)
+        d = d[[c for c in target_columns if c in d.columns]].copy()
+        d['Season'] = season
+        parts.append(d)
+    d = pd.concat(parts, ignore_index=True)
+    d['League'] = league
+    d['Date_Parsed'] = parse_dates(d['Date'])
+    n = len(d)
+    d = (d.dropna(subset=['Date_Parsed', 'HomeTeam', 'AwayTeam', 'FTR'])
+          .sort_values('Date_Parsed', kind='stable').reset_index(drop=True))
+    for c in ['B365H', 'B365D', 'B365A']:
+        d[c] = pd.to_numeric(d[c], errors='coerce') if c in d else np.nan
+    assert d['FTR'].isin(['H', 'D', 'A']).all(), f'{league}: unexpected FTR values'
+    print(f"{league}: {len(d)} matches, {d.Season.min()} to {d.Season.max()}, "
+          f"dropped {n - len(d)} incomplete rows")
+    return d
 
-combined_raw_df = pd.concat(all_dfs, ignore_index=True)
+leagues = {league: load_league(league) for league in USE_LEAGUES}
 
-# 3. Parse dates
-combined_raw_df['Date_Parsed'] = parse_dates(combined_raw_df['Date'])
+# Team histories are keyed by name, so names must be unique across leagues
+names = {l: set(d.HomeTeam) | set(d.AwayTeam) for l, d in leagues.items()}
+for a, b in combinations(names, 2):
+    assert not names[a] & names[b], f'Same team name in {a} and {b}: {names[a] & names[b]}'
 
-# 4. Drop blank/incomplete rows, then sort chronologically
-n_before = len(combined_raw_df)
-combined_raw_df = combined_raw_df.dropna(subset=['Date_Parsed', 'HomeTeam', 'AwayTeam', 'FTR'])
-print(f"Dropped {n_before - len(combined_raw_df)} incomplete rows")
-combined_raw_df = combined_raw_df.sort_values('Date_Parsed', kind='stable').reset_index(drop=True)
-
-# Odds as numbers (some old files store them as text); missing odds stay NaN
-for c in ['B365H', 'B365D', 'B365A']:
-    combined_raw_df[c] = pd.to_numeric(combined_raw_df[c], errors='coerce')
-
-# 5. Season comes from the file name (handles the Covid-delayed 2019/20 season ending in July 2020)
-print(combined_raw_df['Season'].value_counts().sort_index())
-
-# Sanity check: results must be H/D/A only
-bad = ~combined_raw_df['FTR'].isin(['H', 'D', 'A'])
-assert not bad.any(), combined_raw_df[bad].head()
-
-# 6. Elo with promoted teams starting at the average rating of the relegated teams
+# ================= 3. Elo: one rating pool per league =================
 RESULT_TO_SCORE = {'H': 1.0, 'D': 0.5, 'A': 0.0}
 
 def run_elo(df, K=20, h=80, init=1500.0):
     ratings, prev_teams = {}, set()
     home_elo = np.zeros(len(df))
     away_elo = np.zeros(len(df))
-
     for season, sdf in df.groupby('Season', sort=True):
         teams = set(sdf['HomeTeam']) | set(sdf['AwayTeam'])
         if not prev_teams:                                   # first season
@@ -103,7 +127,6 @@ def run_elo(df, K=20, h=80, init=1500.0):
             start = np.mean([ratings[t] for t in relegated]) if relegated else init
             for t in promoted:
                 ratings[t] = start
-
         for i, home, away, res in zip(sdf.index, sdf['HomeTeam'], sdf['AwayTeam'], sdf['FTR']):
             r_h, r_a = ratings[home], ratings[away]
             home_elo[i], away_elo[i] = r_h, r_a              # pre-match ratings → no leakage
@@ -112,29 +135,48 @@ def run_elo(df, K=20, h=80, init=1500.0):
             ratings[home] = r_h + K * (s_h - e_h)
             ratings[away] = r_a - K * (s_h - e_h)
         prev_teams = teams
-
     return home_elo, away_elo
 
-# 7. Tune K and h on the validation seasons only (Brier score of the home expectation)
 VAL_SEASONS = ['2022/23', '2023/24']
 
-def elo_score(df, K, h):
-    he, ae = run_elo(df, K, h)
+def elo_score(d, K, h):
+    """Brier score of the home expectation on ONE league's validation seasons."""
+    he, ae = run_elo(d, K, h)
     e_h = 1.0 / (1.0 + 10 ** ((ae - he - h) / 400.0))
-    s_h = df['FTR'].map(RESULT_TO_SCORE).to_numpy()
-    val = df['Season'].isin(VAL_SEASONS).to_numpy()
-    return np.mean((s_h[val] - e_h[val]) ** 2)
+    val = d['Season'].isin(VAL_SEASONS).to_numpy()
+    return np.mean((d['FTR'].map(RESULT_TO_SCORE).to_numpy()[val] - e_h[val]) ** 2)
 
 grid = [(K, h) for K in [10, 15, 20, 25, 30, 40] for h in [40, 60, 80, 100]]
-best_K, best_h = min(grid, key=lambda p: elo_score(combined_raw_df, *p))
-print(f"Best K = {best_K}, h = {best_h}")
+ELO_PARAMS = {}                                   # league -> (K, h), tuned per league
+for league, d in leagues.items():
+    K, h = min(grid, key=lambda p: elo_score(d, *p))
+    ELO_PARAMS[league] = (K, h)
+    d['Home_Elo'], d['Away_Elo'] = run_elo(d, K, h)
+    d.drop(columns='Date_Parsed').to_csv(f'/content/combined_{league}.csv', index=False)
+    print(f'{league}: K = {K}, h = {h}')
 
-# 8. Final Elo with tuned parameters
-combined_raw_df['Home_Elo'], combined_raw_df['Away_Elo'] = run_elo(combined_raw_df, best_K, best_h)
+# ================= 4. Combine leagues + split label per match =================
+combined_raw_df = (pd.concat(leagues.values(), ignore_index=True)
+                     .sort_values(['Date_Parsed', 'League'], kind='stable')
+                     .reset_index(drop=True))
+s = combined_raw_df['Season']
+first = combined_raw_df.groupby('League')['Season'].transform('min')
+combined_raw_df['Split'] = np.select(              # not used yet; for the next step
+    [s == first, s <= '2020/21', s == '2021/22', s.isin(VAL_SEASONS), s >= '2024/25'],
+    ['burnin', 'train', 'stop', 'val', 'test'], default='?')
 
-# 9. Save master file
-combined_raw_df.drop(columns=['Date_Parsed']).to_csv('/content/combined_data.csv', index=False)
+combined_raw_df.drop(columns='Date_Parsed').to_csv('/content/combined_data.csv', index=False)
 print(f"Saved {len(combined_raw_df)} matches to /content/combined_data.csv")
+
+# ================= 5. Checks =================
+display(pd.crosstab(combined_raw_df.League, combined_raw_df.Split, margins=True))
+counts = combined_raw_df.groupby(['League', 'Season']).size()
+print('Seasons without 380 matches (only 2026/27 expected):\n', counts[counts != 380])
+cov = (combined_raw_df.groupby(['League', 'Season'])
+       [['HTHG', 'HS', 'HST', 'HC', 'HF', 'HY', 'HR', 'B365H']]
+       .apply(lambda g: g.notna().mean()))
+print('Seasons with missing columns (share of matches that have each column):')
+display(cov[(cov < 1).any(axis=1)].round(2))
 
 """### 2. Dataset Splitting by Season
 Here, the combined dataset is split into `train`, `val`, and `test` sets based on the season. The very first season (2000/01) is excluded from training as it is used as a 'burn-in' period for the Elo ratings. The resulting splits are saved to separate CSV files.
@@ -187,6 +229,48 @@ for filename, path in season_files():
 report_df = pd.DataFrame(file_reports)
 display(report_df)
 print(combined_raw_df[combined_raw_df.Season.isin(['2003/04', '2004/05'])].FTR.value_counts())
+
+"""checks for elo"""
+
+# ===== Elo sanity checks: Elo vs bookmaker, and end-of-season Elo vs league table =====
+from scipy.stats import pearsonr, spearmanr
+
+chk = combined_raw_df.copy()
+K_l = chk['League'].map({l: p[0] for l, p in ELO_PARAMS.items()})
+h_l = chk['League'].map({l: p[1] for l, p in ELO_PARAMS.items()})
+chk['elo_exp'] = 1 / (1 + 10 ** ((chk['Away_Elo'] - chk['Home_Elo'] - h_l) / 400))
+
+# --- 1. Elo's expected home score vs the bookmaker's (margin removed), burn-in excluded ---
+inv = 1 / chk[['B365H', 'B365D', 'B365A']].to_numpy(float)
+p = inv / inv.sum(1, keepdims=True)
+chk['book_exp'] = p[:, 0] + 0.5 * p[:, 1]
+
+ok = chk[(chk['Split'] != 'burnin') & chk['book_exp'].notna()]
+rows = {lg: {'matches': len(g), 'r': pearsonr(g['elo_exp'], g['book_exp'])[0]}
+        for lg, g in [*ok.groupby('League'), ('All', ok)]}
+print('1. Elo vs bookmaker, expected home score (Pearson r)')
+display(pd.DataFrame(rows).T.round(3))
+
+# --- 2. End-of-season Elo ranking vs final points table, per completed season ---
+change = K_l * (chk['FTR'].map(RESULT_TO_SCORE) - chk['elo_exp'])     # Elo update per match
+tm = pd.concat([
+    pd.DataFrame({'League': chk.League, 'Season': chk.Season, 'team': chk.HomeTeam,
+                  'pts': chk.FTR.map({'H': 3, 'D': 1, 'A': 0}), 'elo_after': chk.Home_Elo + change}),
+    pd.DataFrame({'League': chk.League, 'Season': chk.Season, 'team': chk.AwayTeam,
+                  'pts': chk.FTR.map({'H': 0, 'D': 1, 'A': 3}), 'elo_after': chk.Away_Elo - change}),
+]).sort_index(kind='stable')                                       # back to match order
+
+table = (tm.groupby(['League', 'Season', 'team'])
+           .agg(points=('pts', 'sum'), elo_end=('elo_after', 'last'))
+           .reset_index())
+first = table.groupby('League')['Season'].transform('min')
+table = table[(table['Season'] != first) & (table['Season'] != table['Season'].max())]
+
+rho = (table.groupby(['League', 'Season'])[['points', 'elo_end']]
+            .apply(lambda g: spearmanr(g['points'], g['elo_end'])[0]))
+print('2. End-of-season Elo vs final table (Spearman rho per season)')
+display(rho.groupby('League').agg(['mean', 'min', 'count']).round(3))
+print(f'All leagues, all seasons: mean rho = {rho.mean():.3f}')
 
 """#### 3.2 Duplicate Record Verification
 To ensure data quality, this cell verifies that there are absolutely no duplicate matches mapped in the combined master dataset.
