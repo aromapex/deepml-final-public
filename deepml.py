@@ -14,7 +14,7 @@ Original file is located at
 #3. Compute continuous pre-match Elo ratings over the full history (no leakage), with promoted teams starting at the average rating of the relegated teams and K, h tuned on the validation seasons.
 #4. Split by season: 2000/01 burn-in (excluded), train 2001/02–2021/22, validation 2022/23–2023/24, test 2024/25 onwards.
 
-"""### 1. Data Loading, Cleaning, and Elo Calculation
+"""### 1. Data Loading, Cleaning, and Elo Calculation - JUST PREM
 This cell handles the initial data pipeline. It reads all historical season files, cleans up malformed rows, parses the dates, and sorts the matches chronologically. It also calculates the pre-match Elo ratings for each team over the entire history, dynamically tuning the Elo parameters ($K$ and $h$) on the validation seasons to avoid data leakage.
 """
 
@@ -53,11 +53,14 @@ def parse_dates(s):
     d[mask] = pd.to_datetime(s[mask], format='%d/%m/%Y', errors='coerce')
     return d
 
-# 2. Load and combine
+# 2. Load and combine (season taken from the file name: 19_20.csv → 2019/20)
 all_dfs = []
 for filename, path in season_files():
     df = load_season(path)
-    all_dfs.append(df[[c for c in target_columns if c in df.columns]].copy())
+    df = df[[c for c in target_columns if c in df.columns]].copy()
+    y = int(filename[:2])
+    df['Season'] = f"{2000 + y}/{y + 1:02d}"
+    all_dfs.append(df)
 
 combined_raw_df = pd.concat(all_dfs, ignore_index=True)
 
@@ -74,12 +77,8 @@ combined_raw_df = combined_raw_df.sort_values('Date_Parsed', kind='stable').rese
 for c in ['B365H', 'B365D', 'B365A']:
     combined_raw_df[c] = pd.to_numeric(combined_raw_df[c], errors='coerce')
 
-# 5. Season column (July–June = one season)
-def get_season(dt):
-    y = dt.year if dt.month >= 7 else dt.year - 1
-    return f"{y}/{str(y + 1)[-2:]}"
-
-combined_raw_df['Season'] = combined_raw_df['Date_Parsed'].apply(get_season)
+# 5. Season comes from the file name (handles the Covid-delayed 2019/20 season ending in July 2020)
+print(combined_raw_df['Season'].value_counts().sort_index())
 
 # Sanity check: results must be H/D/A only
 bad = ~combined_raw_df['FTR'].isin(['H', 'D', 'A'])
